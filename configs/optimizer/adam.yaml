@@ -1,0 +1,9 @@
+name: AdamW
+lr: 1e-4
+backbone_lr: 1e-5
+eta_min: 1e-5
+backbone_eta_min: 1e-5
+weight_decay: 0.05
+clip_grad_norm: 1.0
+warmup_iters: 0
+freeze_lora_after: ~

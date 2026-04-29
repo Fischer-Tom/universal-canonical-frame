@@ -1,0 +1,80 @@
+defaults:
+    - dataset: uco3d
+    - model: pose_model
+    - optimizer: adam
+    - override hydra/hydra_logging: disabled
+    - override hydra/job_logging: disabled
+    - _self_
+
+hydra:
+    output_subdir: config/hydra
+    run:
+        dir: ${logging.run_root}/${experiment_name}/${now:%Y-%m-%d_%H-%M-%S}
+
+experiment_name: "universal_canonical_frame"
+seed: 42
+
+training:
+    epochs: 8
+    batch_size: 8
+    device: "cuda"
+    num_workers: 16
+    image_size: [256, 256]
+    use_torch_compile: false
+
+    augmentation:
+        crop_to_mask: true
+        crop_padding: 0.1
+        crop_padding_range: [0.1, 0.25]
+        geometric_start_iter: 7500
+        recrop_p: 0.7
+        recrop_scale: [0.9, 1.0]
+        recrop_ratio: [0.9, 1.1]
+        recrop_min_size: 48
+        flip_p: 0.0
+        occlusion_start_iter: 7500
+        patch_mask_p: 0.5
+        patch_mask_num: [1, 2]
+        patch_mask_size: [0.05, 0.30]
+        rotate_p: 0.3
+        rotate_deg: 30.0
+        rotate_fill: 0.0
+        jitter_brightness: 0.4
+        jitter_contrast: 0.4
+        jitter_saturation: 0.2
+        jitter_hue: 0.1
+        blur_p: 0.4
+        solarize_p: 0.0
+
+    resume_from: ~
+    resume_from_iteration: ~
+    resume_model_only: false
+    checkpoint_interval: 2000
+    keep_interval_checkpoints: false
+    use_mixed_precision: true
+
+logging:
+    run_root: runs
+    log_subdir: logs
+    vis_subdir: vis
+    checkpoints_subdir: checkpoints
+    log_interval: 100
+
+evaluation:
+    checkpoint: ~
+    datasets: ["dataset"]
+    split: "val"
+    output_root: eval_logs
+    symmetries_csv: "/tmp/ucf_symmetries.csv"
+    seed: ${seed}
+    device: ${training.device}
+    use_gt_mask: false
+
+representation:
+    mesh_type: "cube"
+    gravity: false
+    nside: 8 # sphere: healpix nside
+    subdivisions: 14 # cube: per-face grid
+
+loss:
+    mask_weight: 1.0

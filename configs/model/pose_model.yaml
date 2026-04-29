@@ -1,0 +1,18 @@
+backbone: "dinov3"
+remote_repo_dir: "/home/hpc/b266be/b266be10/dinov3"
+model: "dinov3_vitl16"
+remote_weights: "/hnvme/workspace/b266be10-dinov3/dinov3_vitl16"
+
+bottleneck_dim: 64
+output_size: [64, 64]
+
+finetune_backbone: false
+adapt: false
+
+use_lora: true
+lora_r: 8
+lora_alpha: 8
+lora_dropout: 0.1
+adapt_target_blocks: ~
+adapter_scale: 0.1
+adapter_dropout: 0.0
