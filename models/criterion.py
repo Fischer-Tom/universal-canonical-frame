@@ -10,6 +10,12 @@ from einops import einsum
 from torch import Tensor, nn
 
 
+_RANSAC_WAHBA_ITERS = 100
+_RANSAC_WAHBA_SAMPLE_SIZE = 4
+_RANSAC_WAHBA_INLIER_COS = math.cos(math.radians(25.0))
+_RANSAC_WAHBA_EPS = 1e-6
+
+
 @dataclass
 class AlignmentResult:
     R_frame: torch.Tensor
@@ -22,6 +28,7 @@ class AlignmentResult:
     sched: dict
     snap_ang_deg: torch.Tensor
     alignment_angle: torch.Tensor
+    ransac_inlier_ratio: torch.Tensor
     G: int
     K: int
 
@@ -190,6 +197,134 @@ class Criterion(nn.Module):
 
         return Rf.to(original_dtype)
 
+    @staticmethod
+    @torch.no_grad()
+    def _wahba_matrix_from_points(
+        v: torch.Tensor,
+        v_match: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
+        outer = torch.einsum("ni,nj->nij", v, v_match)
+        return (weights[:, None, None] * outer).sum(dim=0)
+
+    @torch.no_grad()
+    def _wahba_ransac(
+        self,
+        v: torch.Tensor,
+        v_match: torch.Tensor,
+        weights: torch.Tensor,
+        obj_id: torch.Tensor,
+        G: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Robust per-object Wahba via RANSAC + inlier refit.
+
+        RANSAC is internal to the teacher construction: it suppresses stray
+        high-confidence pixels before the existing discrete snap chooses the
+        final canonical-frame rotation.
+        """
+        device = v.device
+        if G == 0:
+            return (
+                torch.empty((0, 3, 3), device=device, dtype=torch.float32),
+                torch.tensor(0.0, device=device),
+            )
+
+        R_out = torch.eye(3, device=device, dtype=torch.float32).expand(G, 3, 3).clone()
+        inlier_ratio = torch.zeros(G, device=device, dtype=torch.float32)
+        has_inlier_metric = torch.zeros(G, device=device, dtype=torch.bool)
+        v_f32 = v.float()
+        v_match_f32 = v_match.float()
+        weights_f32 = weights.float().clamp_min(0.0)
+
+        for g in range(G):
+            mask = obj_id == g
+            if not bool(mask.any()):
+                continue
+
+            vg = v_f32[mask]
+            mg = v_match_f32[mask]
+            wg = weights_f32[mask]
+            valid_global = wg.sum() > _RANSAC_WAHBA_EPS
+            H_global = self._wahba_matrix_from_points(vg, mg, wg).unsqueeze(0)
+            R_global = self._wahba_batched(
+                H_global,
+                valid_mask=valid_global.view(1),
+            )[0].float()
+
+            positive = wg > _RANSAC_WAHBA_EPS
+            n_positive = int(positive.sum().item())
+            if n_positive == 0:
+                R_out[g] = R_global
+                continue
+
+            vp = vg[positive]
+            mp = mg[positive]
+            wp = wg[positive]
+            R_final = R_global
+
+            if n_positive >= _RANSAC_WAHBA_SAMPLE_SIZE:
+                prob = wp / wp.sum().clamp_min(_RANSAC_WAHBA_EPS)
+
+                sample_idx = torch.stack(
+                    [
+                        torch.multinomial(
+                            prob,
+                            _RANSAC_WAHBA_SAMPLE_SIZE,
+                            replacement=False,
+                        )
+                        for _ in range(_RANSAC_WAHBA_ITERS)
+                    ],
+                    dim=0,
+                )
+                vs = vp[sample_idx]
+                ms = mp[sample_idx]
+                ws = wp[sample_idx]
+                H_samples = (
+                    ws[:, :, None, None] * torch.einsum("ksi,ksj->ksij", vs, ms)
+                ).sum(dim=1)
+                R_candidates = self._wahba_batched(
+                    H_samples,
+                    valid_mask=ws.sum(dim=1) > _RANSAC_WAHBA_EPS,
+                ).float()
+
+                pred = torch.matmul(vp.unsqueeze(0), R_candidates.transpose(-1, -2))
+                cos = (pred * mp.unsqueeze(0)).sum(dim=-1).clamp(-1.0, 1.0)
+                inliers = cos >= _RANSAC_WAHBA_INLIER_COS
+                consensus = (inliers.float() * wp.unsqueeze(0)).sum(dim=1)
+                mean_cos = (cos * wp.unsqueeze(0)).sum(dim=1) / wp.sum().clamp_min(
+                    _RANSAC_WAHBA_EPS
+                )
+                best = (consensus + 1e-3 * mean_cos).argmax()
+                best_inliers = inliers[best]
+
+                if int(best_inliers.sum().item()) >= _RANSAC_WAHBA_SAMPLE_SIZE:
+                    H_inlier = self._wahba_matrix_from_points(
+                        vp[best_inliers],
+                        mp[best_inliers],
+                        wp[best_inliers],
+                    ).unsqueeze(0)
+                    R_final = self._wahba_batched(
+                        H_inlier,
+                        valid_mask=torch.ones(1, device=device, dtype=torch.bool),
+                    )[0].float()
+
+            R_out[g] = R_final
+            pred_final = vp @ R_final.transpose(0, 1)
+            final_inliers = (
+                (pred_final * mp).sum(dim=-1).clamp(-1.0, 1.0)
+                >= _RANSAC_WAHBA_INLIER_COS
+            )
+            inlier_ratio[g] = (final_inliers.float() * wp).sum() / wp.sum().clamp_min(
+                _RANSAC_WAHBA_EPS
+            )
+            has_inlier_metric[g] = True
+
+        if bool(has_inlier_metric.any()):
+            mean_inlier_ratio = inlier_ratio[has_inlier_metric].mean()
+        else:
+            mean_inlier_ratio = torch.tensor(0.0, device=device)
+        return R_out, mean_inlier_ratio
+
     def _discretize_wahba(self, R_cont: torch.Tensor):
         scores = torch.einsum("kij,gij->gk", self.Rset, R_cont)
         idx = scores.argmax(dim=1)
@@ -274,17 +409,9 @@ class Criterion(nn.Module):
 
         K = int(frame_obj_id.shape[0]) if frame_obj_id is not None else n_views * G
         with torch.amp.autocast(device_type="cuda", enabled=False):
-            v_f32 = v.float()
-            v_match_f32 = v_match.float()
-            w_f32 = w.float()
-            outer = w_f32[:, None, None] * torch.einsum(
-                "ni,nj->nij", v_f32, v_match_f32
+            R_obj, ransac_inlier_ratio = self._wahba_ransac(
+                v, v_match, w, obj_id.long(), G
             )
-
-            H_obj = torch.zeros((G, 3, 3), device=device, dtype=torch.float32)
-            H_obj.view(G, 9).index_add_(0, obj_id.long(), outer.reshape(N, 9))
-            valid_obj = torch.bincount(obj_id, minlength=G) > 0
-            R_obj = self._wahba_batched(H_obj, valid_mask=valid_obj)
 
             snap_ang_deg = torch.tensor(0.0, device=device)
             if self.discretize:
@@ -312,6 +439,7 @@ class Criterion(nn.Module):
             sched=sched,
             snap_ang_deg=snap_ang_deg,
             alignment_angle=alignment_angle.detach(),
+            ransac_inlier_ratio=ransac_inlier_ratio.detach(),
             G=G,
             K=K,
         )
@@ -377,6 +505,7 @@ class Criterion(nn.Module):
             "obj_id_per_pixel": obj_id,
             "snap_ang_deg": alignment.snap_ang_deg.detach(),
             "alignment_angle": alignment.alignment_angle.detach(),
+            "ransac_inlier_ratio": alignment.ransac_inlier_ratio.detach(),
         }
 
     def forward(
@@ -411,6 +540,7 @@ class Criterion(nn.Module):
                 "obj_id_per_pixel": torch.empty((0,), dtype=torch.long, device=device),
                 "snap_ang_deg": torch.tensor(0.0, device=device),
                 "alignment_angle": torch.tensor(0.0, device=device),
+                "ransac_inlier_ratio": torch.tensor(0.0, device=device),
             }
 
         alignment = self.align(

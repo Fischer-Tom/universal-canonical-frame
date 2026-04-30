@@ -25,11 +25,15 @@ _LOSS_KEYS = (
     "loss_total",
     "loss_mesh",
     "loss_mask",
+    "loss_aug_consistency",
     "loss_entropy",
     "entropy_ratio",
     "alignment_cos",
     "alignment_angle",
+    "ransac_inlier_ratio",
     "snap_ang_deg",
+    "aug_consistency_weight",
+    "aug_consistency_pixels",
 )
 
 
