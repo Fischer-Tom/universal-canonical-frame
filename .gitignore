@@ -170,8 +170,6 @@ outputs/
 logs/
 
 # Datasets / large data
-dataset/
-datasets/
 data/
 *.tar
 *.tar.gz

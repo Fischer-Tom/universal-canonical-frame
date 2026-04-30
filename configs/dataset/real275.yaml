@@ -1,0 +1,5 @@
+_target_: dataset.eval_datasets.Real275
+
+split: "test"
+data_root: "/path/to/real275"
+cate: ~

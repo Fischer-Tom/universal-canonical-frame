@@ -1,0 +1,5 @@
+_target_: dataset.eval_datasets.ImageNet3D
+
+split: "val"
+data_root: "/path/to/imagenet3d"
+cate: ~

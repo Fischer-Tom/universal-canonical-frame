@@ -1,0 +1,5 @@
+_target_: dataset.eval_datasets.Objectron
+
+split: "objectron"
+data_root: "/path/to/objectron"
+cate: ~

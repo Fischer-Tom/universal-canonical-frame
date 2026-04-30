@@ -1,0 +1,5 @@
+_target_: dataset.eval_datasets.Pascal3D
+
+split: "val"
+data_root: "/path/to/pascal3d"
+cate: ~

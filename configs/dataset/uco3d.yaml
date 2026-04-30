@@ -1,0 +1,16 @@
+_target_: dataset.uco3d_dataset.UCO3DDataset
+
+split: "train"
+data_root: ~
+subset_lists_file: ~
+categories: ~
+frames_per_sequence: 4
+load_images: true
+load_masks: true
+load_point_clouds: true
+normalize_object: true
+remove_empty_masks: true
+limit_sequences: 0
+seed: ${seed}
+skip_bad: true
+undistort_alpha: 0.5

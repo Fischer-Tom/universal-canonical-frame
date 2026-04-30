@@ -1,0 +1,5 @@
+_target_: dataset.eval_datasets.Omni6DPose
+
+split: "test"
+data_root: "/path/to/omni6dpose"
+cate: ~
