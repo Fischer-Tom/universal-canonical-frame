@@ -8,6 +8,7 @@ frames_per_sequence: 4
 load_images: true
 load_masks: true
 load_point_clouds: true
+apply_alignment: true
 normalize_object: true
 remove_empty_masks: true
 limit_sequences: 0

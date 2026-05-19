@@ -212,13 +212,21 @@ class Annotator:
         multi_frame,
         R_obj: torch.Tensor,
         obj_id_per_frame: torch.Tensor = None,
+        base_cameras=None,
         deform=False,
     ) -> AnnotationResult:
         if obj_id_per_frame is None:
             seq_lengths = torch.tensor(multi_frame.seq_lengths, device=self.device)
             obj_id_per_frame = torch.arange(len(seq_lengths), device=self.device).repeat_interleave(seq_lengths)
 
-        cameras = multi_frame.cameras.clone()
+        if base_cameras is None:
+            annotations = getattr(multi_frame, "annotations", None)
+            if annotations is not None:
+                base_cameras = getattr(annotations, "cameras", None)
+        if base_cameras is None:
+            base_cameras = multi_frame.cameras
+
+        cameras = base_cameras.clone()
         cameras.R = R_obj[obj_id_per_frame] @ cameras.R
         return self.__call__(
             multi_frame, deform=deform, rescale_T=False, cameras_override=cameras

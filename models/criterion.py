@@ -9,7 +9,6 @@ import torch.nn.functional as F
 from einops import einsum
 from torch import Tensor, nn
 
-
 _RANSAC_WAHBA_ITERS = 100
 _RANSAC_WAHBA_SAMPLE_SIZE = 4
 _RANSAC_WAHBA_INLIER_COS = math.cos(math.radians(25.0))
@@ -73,6 +72,8 @@ class Criterion(nn.Module):
         representation: str = "cube",
         gravity: bool = False,
         mask_loss_weight: float = 1.0,
+        discretize: bool = True,
+        force_identity_alignment: bool = False,
     ):
         super().__init__()
         self.register_buffer("V", V)
@@ -83,9 +84,14 @@ class Criterion(nn.Module):
         self.total_iters = total_iters
         self.c_iter = 0
         self.mask_loss_weight = float(mask_loss_weight)
+        self.force_identity_alignment = bool(force_identity_alignment)
 
-        self.discretize = representation == "cube"
-        if gravity and not self.discretize:
+        self.discretize = (
+            discretize
+            and (representation == "cube")
+            and not self.force_identity_alignment
+        )
+        if gravity and not self.discretize and not self.force_identity_alignment:
             raise ValueError(
                 "gravity=True is only supported with representation='cube'"
             )
@@ -310,10 +316,9 @@ class Criterion(nn.Module):
 
             R_out[g] = R_final
             pred_final = vp @ R_final.transpose(0, 1)
-            final_inliers = (
-                (pred_final * mp).sum(dim=-1).clamp(-1.0, 1.0)
-                >= _RANSAC_WAHBA_INLIER_COS
-            )
+            final_inliers = (pred_final * mp).sum(dim=-1).clamp(
+                -1.0, 1.0
+            ) >= _RANSAC_WAHBA_INLIER_COS
             inlier_ratio[g] = (final_inliers.float() * wp).sum() / wp.sum().clamp_min(
                 _RANSAC_WAHBA_EPS
             )
@@ -408,17 +413,23 @@ class Criterion(nn.Module):
         w = (1.0 - Hn_norm).clamp(0.0, 1.0).pow(gamma)
 
         K = int(frame_obj_id.shape[0]) if frame_obj_id is not None else n_views * G
-        with torch.amp.autocast(device_type="cuda", enabled=False):
-            R_obj, ransac_inlier_ratio = self._wahba_ransac(
-                v, v_match, w, obj_id.long(), G
+        snap_ang_deg = torch.tensor(0.0, device=device)
+        if self.force_identity_alignment:
+            R_obj = torch.eye(3, device=device, dtype=torch.float32).expand(
+                G, 3, 3
             )
+            ransac_inlier_ratio = torch.tensor(0.0, device=device)
+        else:
+            with torch.amp.autocast(device_type="cuda", enabled=False):
+                R_obj, ransac_inlier_ratio = self._wahba_ransac(
+                    v, v_match, w, obj_id.long(), G
+                )
 
-            snap_ang_deg = torch.tensor(0.0, device=device)
-            if self.discretize:
-                R_obj_snap, ang_deg = self._discretize_wahba(R_obj)
-                snap_ang_deg = ang_deg.mean()
-                if sched["discretize"]:
-                    R_obj = R_obj_snap
+                if self.discretize:
+                    R_obj_snap, ang_deg = self._discretize_wahba(R_obj)
+                    snap_ang_deg = ang_deg.mean()
+                    if sched["discretize"]:
+                        R_obj = R_obj_snap
 
         if frame_obj_id is None:
             frame_obj_id = torch.arange(G, device=device).repeat_interleave(n_views)
@@ -504,7 +515,7 @@ class Criterion(nn.Module):
             "R_frame": alignment.R_frame.detach(),
             "obj_id_per_pixel": obj_id,
             "snap_ang_deg": alignment.snap_ang_deg.detach(),
-            "alignment_angle": alignment.alignment_angle.detach(),
+            "alignment_angle": alignment_cos.detach(),
             "ransac_inlier_ratio": alignment.ransac_inlier_ratio.detach(),
         }
 

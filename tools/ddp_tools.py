@@ -1,27 +1,35 @@
-import os
 import builtins
+import os
+
 import torch
 import torch.distributed as dist
+
 
 def is_dist_avail_and_initialized() -> bool:
     return dist.is_available() and dist.is_initialized()
 
+
 def get_world_size() -> int:
     return dist.get_world_size() if is_dist_avail_and_initialized() else 1
+
 
 def get_rank() -> int:
     return dist.get_rank() if is_dist_avail_and_initialized() else 0
 
+
 def is_main_process() -> bool:
     return get_rank() == 0
+
 
 def dprint(*args, **kwargs):
     if is_main_process():
         print(*args, **kwargs)
 
+
 def save_on_master(*args, **kwargs):
     if is_main_process():
         torch.save(*args, **kwargs)
+
 
 def setup_for_distributed(is_master: bool):
     """
@@ -38,6 +46,7 @@ def setup_for_distributed(is_master: bool):
 
     builtins.print = custom_print
 
+
 def ddp_all_skip(skip_local: bool, device: torch.device) -> bool:
     """
     Synchronizes a skip flag across all ranks using a MAX reduction.
@@ -52,6 +61,7 @@ def ddp_all_skip(skip_local: bool, device: torch.device) -> bool:
     if is_dist_avail_and_initialized():
         dist.all_reduce(t, op=dist.ReduceOp.MAX)
     return bool(t.item())
+
 
 def reduce_tensor(tensor: torch.Tensor, average: bool = True) -> torch.Tensor:
     """
@@ -70,6 +80,7 @@ def reduce_tensor(tensor: torch.Tensor, average: bool = True) -> torch.Tensor:
     if average:
         rt /= get_world_size()
     return rt
+
 
 def reduce_dict(input_dict: dict, average: bool = True) -> dict:
     """
@@ -92,6 +103,7 @@ def reduce_dict(input_dict: dict, average: bool = True) -> dict:
             values /= get_world_size()
         return {k: v for k, v in zip(names, values)}
 
+
 def init_ddp() -> torch.device:
     """
     Initializes the PyTorch distributed process group based on standard environment variables.
@@ -110,7 +122,7 @@ def init_ddp() -> torch.device:
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
         local_rank = int(os.environ["LOCAL_RANK"])
-    elif "SLURM_PROCID" in os.environ:
+    elif "SLURM_PROCID" in os.environ and "SLURM_NTASKS" in os.environ:
         rank = int(os.environ["SLURM_PROCID"])
         world_size = int(os.environ["SLURM_NTASKS"])
         local_rank = rank % torch.cuda.device_count()
@@ -120,10 +132,7 @@ def init_ddp() -> torch.device:
 
     torch.cuda.set_device(local_rank)
     dist.init_process_group(
-        backend="nccl",
-        init_method="env://",
-        world_size=world_size,
-        rank=rank
+        backend="nccl", init_method="env://", world_size=world_size, rank=rank
     )
     dist.barrier(device_ids=[local_rank])
     setup_for_distributed(rank == 0)

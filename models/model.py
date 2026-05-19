@@ -1,15 +1,13 @@
 import torch
 import torch.nn.functional as F
-from torch import nn
-
 from dataset.schema import Batch
-from tools.annotate import AnnotationResult
+from tools.annotate import AnnotationResult, Annotator
+from torch import nn
 
 from .criterion import Criterion
 from .dino import DINO
 from .heads import MaskHead, MeshCorrespondenceHead
 from .mesh_decoder import MeshDecoder
-
 
 AUG_CONSISTENCY_TEMP = 0.1
 AUG_CONSISTENCY_MAX_PIXELS = 16384
@@ -94,8 +92,15 @@ class GpuPhotometricAug(nn.Module):
                 ).item()
             )
             for _ in range(n_patches):
-                h_frac = torch.empty((), device=x.device).uniform_(*self.patch_size).item()
-                w_frac = torch.empty((), device=x.device).uniform_(*self.patch_size).item()
+                h_frac = (
+                    torch.empty((), device=x.device).uniform_(*self.patch_size).item()
+                )
+                h_frac = (
+                    torch.empty((), device=x.device).uniform_(*self.patch_size).item()
+                )
+                w_frac = (
+                    torch.empty((), device=x.device).uniform_(*self.patch_size).item()
+                )
                 ph = max(1, min(H, int(round(base * h_frac))))
                 pw = max(1, min(W, int(round(base * w_frac))))
                 y = int(torch.randint(0, H - ph + 1, (1,), device=x.device).item())
@@ -110,10 +115,15 @@ class GpuPhotometricAug(nn.Module):
             rgb = (out * self.std.to(out) + self.mean.to(out)).clamp(0, 1)
             B = rgb.shape[0]
             if self.color_scale > 0:
-                scale = 1.0 + (
-                    torch.rand((B, 3, 1, 1), device=rgb.device, dtype=rgb.dtype) * 2.0
-                    - 1.0
-                ) * self.color_scale
+                scale = (
+                    1.0
+                    + (
+                        torch.rand((B, 3, 1, 1), device=rgb.device, dtype=rgb.dtype)
+                        * 2.0
+                        - 1.0
+                    )
+                    * self.color_scale
+                )
                 rgb = rgb * scale
             if self.color_bias > 0:
                 bias = (
@@ -138,15 +148,25 @@ def _resize_mask(mask: torch.Tensor, size_hw):
 
 
 class Model(nn.Module):
-    def __init__(self, cfg, V: torch.Tensor, F: torch.Tensor, total_iters: int = None):
+    def __init__(
+        self,
+        cfg,
+        V: torch.Tensor,
+        F: torch.Tensor,
+        total_iters: int = None,
+        annotator: Annotator | None = None,
+    ):
         super().__init__()
         self.cfg = cfg
-        self.backbone = DINO(256, cfg.model, adapt=cfg.model.get("adapt", True))
+        self.annotator = annotator
+        self.backbone = DINO(512, cfg.model, adapt=cfg.model.get("adapt", True))
         self.mesh_decoder = MeshDecoder(
-            V, n_blocks=4, n_heads=8, d_model=256, dim_feedforward=1024
+            V, n_blocks=6, n_heads=8, d_model=512, dim_feedforward=2048
         )
-        self.correspondence_head = MeshCorrespondenceHead(d_model=256, d_desc=256)
-        self.mask_head = MaskHead(d_model=256)
+        self.correspondence_head = MeshCorrespondenceHead(d_model=512, d_desc=512)
+        self.mask_head = MaskHead(d_model=512)
+        pca_init = bool(cfg.representation.get("pca_init", True))
+        discretize = bool(cfg.representation.get("discretize", True)) and pca_init
         self.criterion = Criterion(
             V,
             F,
@@ -154,14 +174,22 @@ class Model(nn.Module):
             representation=cfg.representation.mesh_type,
             gravity=cfg.representation.get("gravity", False),
             mask_loss_weight=cfg.get("loss", {}).get("mask_weight", 10.0),
+            discretize=discretize,
+            force_identity_alignment=cfg.representation.get(
+                "force_identity_alignment", False
+            ),
         )
         self.n_views_per_seq = int(cfg.dataset.frames_per_sequence)
+        self.rerender_without_discretization = bool(
+            cfg.representation.get("rerender_without_discretization", True)
+        )
+        self.force_identity_alignment = bool(
+            cfg.representation.get("force_identity_alignment", False)
+        )
         self.register_buffer("V", V)
         self.register_buffer("F", F)
         loss_cfg = cfg.get("loss", {})
-        self.aug_consistency_weight = float(
-            loss_cfg.get("aug_consistency_weight", 0.0)
-        )
+        self.aug_consistency_weight = float(loss_cfg.get("aug_consistency_weight", 0.0))
         self.aug_consistency_temp = AUG_CONSISTENCY_TEMP
         self.aug_consistency_max_pixels = AUG_CONSISTENCY_MAX_PIXELS
         self.aug_consistency_min_conf = AUG_CONSISTENCY_MIN_CONFIDENCE
@@ -218,9 +246,9 @@ class Model(nn.Module):
         p_a = logp_a.exp()
         p_b = logp_b.exp()
         if not logits_b.requires_grad:
-            return F.kl_div(logp_a, p_b.detach(), reduction="batchmean"), logits_a.new_tensor(
-                float(z_a.shape[0])
-            )
+            return F.kl_div(
+                logp_a, p_b.detach(), reduction="batchmean"
+            ), logits_a.new_tensor(float(z_a.shape[0]))
         loss_ab = F.kl_div(logp_b, p_a.detach(), reduction="batchmean")
         loss_ba = F.kl_div(logp_a, p_b.detach(), reduction="batchmean")
         return 0.5 * (loss_ab + loss_ba), logits_a.new_tensor(float(z_a.shape[0]))
@@ -242,19 +270,46 @@ class Model(nn.Module):
         _, b_sel, yx_sel, mask_flat = _gather_valid_feats(feats, geom_mask.long())
         xyz_sel = xyz.reshape(-1, 3)[mask_flat.bool()]
 
-        loss_dict = self.criterion(
-            logits=logits,
-            mask_logits=mask_logits,
-            gt_mask=render_mask,
-            valid_region=valid_mask,
-            yx_sel=yx_sel,
-            v_sel=xyz_sel,
-            b_sel=b_sel,
-            n_views=self.n_views_per_seq,
-            resolution=list(feats.shape[-2:]),
-            img2obj=annotations.obj_idx,
-            n_objects=batch.num_sequences,
+        use_rerender = (
+            self.training
+            and self.rerender_without_discretization
+            and not self.criterion.discretize
+            and not self.force_identity_alignment
         )
+        if use_rerender:
+            if self.annotator is None:
+                raise ValueError(
+                    "Rerendering without criterion discretization requires an "
+                    "Annotator. Pass annotator to Model(...)."
+                )
+            loss_dict, annotations_for_loss, geom_mask_for_vis = (
+                self._loss_with_rerendered_annotations(
+                    batch=batch,
+                    annotations=annotations,
+                    feats=feats,
+                    logits=logits,
+                    mask_logits=mask_logits,
+                    yx_sel=yx_sel,
+                    xyz_sel=xyz_sel,
+                    b_sel=b_sel,
+                )
+            )
+        else:
+            loss_dict = self.criterion(
+                logits=logits,
+                mask_logits=mask_logits,
+                gt_mask=render_mask,
+                valid_region=valid_mask,
+                yx_sel=yx_sel,
+                v_sel=xyz_sel,
+                b_sel=b_sel,
+                n_views=self.n_views_per_seq,
+                resolution=list(feats.shape[-2:]),
+                img2obj=annotations.obj_idx,
+                n_objects=batch.num_sequences,
+            )
+            annotations_for_loss = annotations
+            geom_mask_for_vis = geom_mask
 
         aug_scale = self.aug_consistency_weight if self.training else 0.0
         if aug_scale > 0:
@@ -264,7 +319,7 @@ class Model(nn.Module):
             loss_aug, n_aug = self._correspondence_consistency_loss(
                 logits,
                 logits_aug,
-                geom_mask,
+                geom_mask_for_vis,
                 keep_aug,
                 tuple(feats.shape[-2:]),
             )
@@ -278,8 +333,110 @@ class Model(nn.Module):
             loss_dict["aug_consistency_weight"] = logits.new_tensor(0.0)
             loss_dict["aug_consistency_pixels"] = logits.new_tensor(0.0)
 
+        batch.annotations = annotations_for_loss
+        self._last_geom_mask = geom_mask_for_vis.detach()
         self.criterion.c_iter += 1
         return loss_dict
+
+    def _loss_with_rerendered_annotations(
+        self,
+        *,
+        batch: Batch,
+        annotations: AnnotationResult,
+        feats: torch.Tensor,
+        logits: torch.Tensor,
+        mask_logits: torch.Tensor,
+        yx_sel: torch.Tensor,
+        xyz_sel: torch.Tensor,
+        b_sel: torch.Tensor,
+    ):
+        alignment = self.criterion.align(
+            logits=logits,
+            yx_sel=yx_sel,
+            v_sel=xyz_sel,
+            b_sel=b_sel,
+            n_views=self.n_views_per_seq,
+            resolution=list(feats.shape[-2:]),
+            img2obj=annotations.obj_idx,
+            n_objects=batch.num_sequences,
+        )
+        if alignment is None:
+            loss_dict = self.criterion(
+                logits=logits,
+                mask_logits=mask_logits,
+                gt_mask=annotations.render_mask,
+                valid_region=annotations.valid_mask,
+                yx_sel=yx_sel,
+                v_sel=xyz_sel,
+                b_sel=b_sel,
+                n_views=self.n_views_per_seq,
+                resolution=list(feats.shape[-2:]),
+                img2obj=annotations.obj_idx,
+                n_objects=batch.num_sequences,
+            )
+            return loss_dict, annotations, annotations.geom_mask
+
+        device = logits.device
+        frame_indices = torch.arange(len(batch.cameras), device=device)
+        with (
+            torch.no_grad(),
+            torch.amp.autocast(device_type=device.type, enabled=False),
+        ):
+            rerendered = self.annotator.rerender_aligned(
+                batch,
+                alignment.R_frame.float(),
+                obj_id_per_frame=frame_indices,
+                base_cameras=annotations.cameras,
+                deform=False,
+            )
+
+        _, b_new, yx_new, mask_flat_new = _gather_valid_feats(
+            feats, rerendered.geom_mask.long()
+        )
+        xyz_new = rerendered.obj_xyz.reshape(-1, 3)[mask_flat_new.bool()]
+        if yx_new.shape[0] == 0:
+            loss_dict = self.criterion(
+                logits=logits,
+                mask_logits=mask_logits,
+                gt_mask=rerendered.render_mask,
+                valid_region=rerendered.valid_mask,
+                yx_sel=yx_new,
+                v_sel=xyz_new,
+                b_sel=b_new,
+                n_views=self.n_views_per_seq,
+                resolution=list(feats.shape[-2:]),
+                img2obj=rerendered.obj_idx,
+                n_objects=batch.num_sequences,
+            )
+            return loss_dict, rerendered, rerendered.geom_mask
+
+        H, W = feats.shape[-2:]
+        y = yx_new[:, 0].long().clamp(0, H - 1)
+        x = yx_new[:, 1].long().clamp(0, W - 1)
+        pix_idx = y * W + x
+        Lf_student = logits[b_new.long(), :, pix_idx] / float(alignment.sched["T_f"])
+
+        v_new = self.criterion.l2_normalize(
+            xyz_new.to(device=device, dtype=logits.dtype), dim=1
+        )
+
+        alignment.v = v_new
+        alignment.Rv = v_new
+        alignment.Lf_student = Lf_student
+        alignment.b_sel = b_new
+        alignment.obj_id = rerendered.obj_idx.to(device=device, dtype=torch.long)[
+            b_new.long()
+        ]
+
+        loss_dict = self.criterion.compute_loss(
+            alignment,
+            mask_logits,
+            gt_mask=rerendered.render_mask,
+            valid_region=rerendered.valid_mask,
+        )
+        loss_dict["obj_xyz_pre_align"] = annotations.obj_xyz.detach()
+        loss_dict["obj_xyz_post_align"] = rerendered.obj_xyz.detach()
+        return loss_dict, rerendered, rerendered.geom_mask
 
     @torch.no_grad()
     def infer(

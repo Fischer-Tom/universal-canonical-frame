@@ -15,7 +15,7 @@ experiment_name: "universal_canonical_frame"
 seed: 42
 
 training:
-    epochs: 8
+    epochs: 15
     batch_size: 8
     device: "cuda"
     num_workers: 16
@@ -73,7 +73,11 @@ evaluation:
 representation:
     mesh_type: "cube"
     gravity: false
-    nside: 8 # sphere: healpix nside
+    pca_init: true
+    discretize: false
+    force_identity_alignment: false
+    rerender_without_discretization: true
+    nside: 9 # sphere: healpix nside
     subdivisions: 14 # cube: per-face grid
 
 loss:

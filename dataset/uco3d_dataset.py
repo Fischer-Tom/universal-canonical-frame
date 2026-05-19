@@ -66,6 +66,7 @@ class UCO3DDataset(Dataset):
         load_images: bool = True,
         load_masks: bool = True,
         load_point_clouds: bool = True,
+        apply_alignment: bool = True,
         normalize_object: bool = True,
         remove_empty_masks: bool = True,
         limit_sequences: int = 0,
@@ -93,6 +94,7 @@ class UCO3DDataset(Dataset):
         self.load_images = load_images
         self.load_masks = load_masks
         self.load_point_clouds = load_point_clouds
+        self.apply_alignment = apply_alignment
         self.normalize_object = normalize_object
         self.remove_empty_masks = remove_empty_masks
         self.limit_sequences = limit_sequences
@@ -166,7 +168,10 @@ class UCO3DDataset(Dataset):
         seq_orm = self._fetch_seq(seq_name)
         frames = [self._build_frame(seq_name, fn, seq_orm) for fn in frame_numbers]
         sample = SequenceSample.from_frames(frames)
-        sample.segmented_point_cloud = align_point_cloud(self._load_pointcloud(seq_orm), seq_orm)
+        point_cloud = self._load_pointcloud(seq_orm)
+        if self.apply_alignment:
+            point_cloud = align_point_cloud(point_cloud, seq_orm)
+        sample.segmented_point_cloud = point_cloud
         if self.normalize_object:
             sample = normalize_sequence_to_bbox(sample)
         return sample
@@ -184,7 +189,8 @@ class UCO3DDataset(Dataset):
 
         if record.image_rgb is not None:
             record = undistort_frame(record, distortion, alpha=self.undistort_alpha)
-        record = align_frame(record, seq_orm)
+        if self.apply_alignment:
+            record = align_frame(record, seq_orm)
         return record
 
     # ------------------------------------------------------------------

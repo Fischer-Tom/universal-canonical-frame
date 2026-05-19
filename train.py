@@ -121,7 +121,7 @@ def main(cfg: DictConfig) -> None:
     F_t = torch.from_numpy(F).to(device)
     annotator = Annotator(V_t, F_t, list(cfg.model.output_size), device=device)
 
-    model = Model(cfg, V_t, F_t, total_iters).to(device)
+    model = Model(cfg, V_t, F_t, total_iters, annotator=annotator).to(device)
     model_without_ddp = model
     if distributed:
         model = torch.nn.parallel.DistributedDataParallel(
