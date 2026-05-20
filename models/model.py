@@ -1,13 +1,15 @@
 import torch
 import torch.nn.functional as F
-from dataset.schema import Batch
-from tools.annotate import AnnotationResult, Annotator
 from torch import nn
 
+from dataset.schema import Batch
+from tools.annotate import AnnotationResult, Annotator
+
 from .criterion import Criterion
-from .dino import DINO
+from .dino import DINOExtractor
 from .heads import MaskHead, MeshCorrespondenceHead
 from .mesh_decoder import MeshDecoder
+from .vggt import VGGTExtractor
 
 AUG_CONSISTENCY_TEMP = 0.1
 AUG_CONSISTENCY_MAX_PIXELS = 16384
@@ -159,7 +161,10 @@ class Model(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.annotator = annotator
-        self.backbone = DINO(512, cfg.model, adapt=cfg.model.get("adapt", True))
+        if cfg.model.get("backbone_arch", "dino") == "vggt":
+            self.backbone = VGGTExtractor(512, cfg.model)
+        else:
+            self.backbone = DINOExtractor(512, cfg.model)
         self.mesh_decoder = MeshDecoder(
             V, n_blocks=6, n_heads=8, d_model=512, dim_feedforward=2048
         )

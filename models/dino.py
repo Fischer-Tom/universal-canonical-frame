@@ -191,7 +191,7 @@ class Feature2Pyramid(nn.Module):
         return tuple(self.ops[i](f) for i, f in enumerate(inputs))
 
 
-class DINO(nn.Module):
+class DINOExtractor(nn.Module):
     def __init__(
         self,
         out_ch: int,
@@ -200,9 +200,9 @@ class DINO(nn.Module):
         adapt: bool = False,
     ):
         super().__init__()
-        weights_path = cfg.remote_weights if os.path.exists(cfg.remote_weights) else cfg.local_weights
-        repo_path = cfg.remote_repo_dir if os.path.exists(cfg.remote_repo_dir) else cfg.local_repo_dir
-        self.backbone = torch.hub.load(repo_path, cfg.model, source="local", pretrained=False)
+        weights_path = cfg.dino.remote_weights if os.path.exists(cfg.dino.remote_weights) else cfg.dino.local_weights
+        repo_path = cfg.dino.remote_repo_dir if os.path.exists(cfg.dino.remote_repo_dir) else cfg.dino.local_repo_dir
+        self.backbone = torch.hub.load(repo_path, cfg.dino.model, source="local", pretrained=False)
         self.backbone.load_state_dict(torch.load(weights_path))
         
 

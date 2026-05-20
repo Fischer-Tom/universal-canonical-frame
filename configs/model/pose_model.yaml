@@ -1,15 +1,24 @@
-backbone: "dinov3"
-remote_repo_dir: "/home/hpc/b266be/b266be10/dinov3"
-model: "dinov3_vitl16"
-remote_weights: "/hnvme/workspace/b266be10-dinov3/dinov3_vitl16"
+dino:
+    backbone: "dinov3"
+    remote_repo_dir: "/home/hpc/b266be/b266be10/dinov3"
+    model: "dinov3_vitl16"
+    remote_weights: "/hnvme/workspace/b266be10-dinov3/dinov3_vitl16"
+vggt:
+    backbone: "vggt_omega"
+    remote_repo_dir: "/"
+    model: "vitl16"
+    remote_weights: "/hnvme/workspace/b266be10-dinov3/vggt_omega_1b_512.pt"
 
 bottleneck_dim: 64
 output_size: [64, 64]
 
+backbone_arch: "vggt"
+vggt_feature_source: "patch_embed"
 finetune_backbone: false
 adapt: false
 
 use_lora: true
+vggt_lora_target: "patch_embed"
 lora_r: 8
 lora_alpha: 8
 lora_dropout: 0.1
