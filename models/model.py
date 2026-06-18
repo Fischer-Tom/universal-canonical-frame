@@ -7,7 +7,7 @@ from tools.annotate import AnnotationResult, Annotator
 
 from .criterion import Criterion
 from .dino import DINOExtractor
-from .heads import MaskHead, MeshCorrespondenceHead
+from .heads import MaskHead, MeshCorrespondenceHead, PoseHead
 from .mesh_decoder import MeshDecoder
 from .vggt import VGGTExtractor
 
@@ -149,6 +149,39 @@ def _resize_mask(mask: torch.Tensor, size_hw):
     return F.interpolate(mask.float(), size=size_hw, mode="nearest").squeeze(1).bool()
 
 
+def _rotation_matrix_to_quaternion(R: torch.Tensor):
+    Rf = R.float()
+    m00 = Rf[..., 0, 0]
+    m01 = Rf[..., 0, 1]
+    m02 = Rf[..., 0, 2]
+    m10 = Rf[..., 1, 0]
+    m11 = Rf[..., 1, 1]
+    m12 = Rf[..., 1, 2]
+    m20 = Rf[..., 2, 0]
+    m21 = Rf[..., 2, 1]
+    m22 = Rf[..., 2, 2]
+
+    qw = 0.5 * torch.sqrt((1.0 + m00 + m11 + m22).clamp_min(0.0))
+    qx = 0.5 * torch.sqrt((1.0 + m00 - m11 - m22).clamp_min(0.0))
+    qy = 0.5 * torch.sqrt((1.0 - m00 + m11 - m22).clamp_min(0.0))
+    qz = 0.5 * torch.sqrt((1.0 - m00 - m11 + m22).clamp_min(0.0))
+
+    qx = torch.where((m21 - m12) < 0.0, -qx, qx)
+    qy = torch.where((m02 - m20) < 0.0, -qy, qy)
+    qz = torch.where((m10 - m01) < 0.0, -qz, qz)
+    quat = torch.stack([qw, qx, qy, qz], dim=-1)
+    return F.normalize(quat, dim=-1, eps=1e-8)
+
+
+def _quaternion_pose_loss(pred_quat: torch.Tensor, target_R: torch.Tensor):
+    pred = F.normalize(pred_quat.float(), dim=-1, eps=1e-8)
+    target = _rotation_matrix_to_quaternion(target_R.detach())
+    dot = (pred * target).sum(dim=-1).abs().clamp(0.0, 1.0)
+    loss = (1.0 - dot).mean()
+    angle_deg = (2.0 * torch.acos(dot) * (180.0 / torch.pi)).mean()
+    return loss, angle_deg
+
+
 class Model(nn.Module):
     def __init__(
         self,
@@ -170,6 +203,7 @@ class Model(nn.Module):
         )
         self.correspondence_head = MeshCorrespondenceHead(d_model=512, d_desc=512)
         self.mask_head = MaskHead(d_model=512)
+        self.pose_head = PoseHead(d_model=512)
         pca_init = bool(cfg.representation.get("pca_init", True))
         discretize = bool(cfg.representation.get("discretize", True)) and pca_init
         self.criterion = Criterion(
@@ -195,6 +229,7 @@ class Model(nn.Module):
         self.register_buffer("F", F)
         loss_cfg = cfg.get("loss", {})
         self.aug_consistency_weight = float(loss_cfg.get("aug_consistency_weight", 0.0))
+        self.pose_weight = float(loss_cfg.get("pose_weight", 0.1))
         self.aug_consistency_temp = AUG_CONSISTENCY_TEMP
         self.aug_consistency_max_pixels = AUG_CONSISTENCY_MAX_PIXELS
         self.aug_consistency_min_conf = AUG_CONSISTENCY_MIN_CONFIDENCE
@@ -205,7 +240,7 @@ class Model(nn.Module):
         mesh_descriptors = self.mesh_decoder(feats)
         logits = self.correspondence_head(mesh_descriptors, feats)
         mask_logits = self.mask_head(feats)
-        return feats, logits, mask_logits
+        return feats, mesh_descriptors, logits, mask_logits
 
     def _correspondence_consistency_loss(
         self,
@@ -265,7 +300,8 @@ class Model(nn.Module):
         valid_mask = annotations.valid_mask
         xyz = annotations.obj_xyz
 
-        feats, logits, mask_logits = self.predict(img)
+        feats, mesh_descriptors, logits, mask_logits = self.predict(img)
+        pose_quat = self.pose_head(mesh_descriptors)
 
         self._last_logits = logits.detach()
         self._last_img = img.detach()
@@ -316,11 +352,19 @@ class Model(nn.Module):
             annotations_for_loss = annotations
             geom_mask_for_vis = geom_mask
 
+        self._add_pose_loss(
+            loss_dict=loss_dict,
+            pose_quat=pose_quat,
+            source_annotations=annotations,
+            annotations_for_loss=annotations_for_loss,
+            used_rerender=use_rerender,
+        )
+
         aug_scale = self.aug_consistency_weight if self.training else 0.0
         if aug_scale > 0:
             img_aug, keep_aug = self.photometric_aug(img)
             with torch.no_grad():
-                _, logits_aug, _ = self.predict(img_aug)
+                _, _, logits_aug, _ = self.predict(img_aug)
             loss_aug, n_aug = self._correspondence_consistency_loss(
                 logits,
                 logits_aug,
@@ -342,6 +386,55 @@ class Model(nn.Module):
         self._last_geom_mask = geom_mask_for_vis.detach()
         self.criterion.c_iter += 1
         return loss_dict
+
+    def _post_alignment_camera_R(
+        self,
+        *,
+        loss_dict: dict,
+        source_annotations: AnnotationResult,
+        annotations_for_loss: AnnotationResult,
+        used_rerender: bool,
+    ):
+        if used_rerender:
+            return annotations_for_loss.cameras.R
+
+        base_R = source_annotations.cameras.R
+        R_frame = loss_dict.get("R_frame", None)
+        if (
+            isinstance(R_frame, torch.Tensor)
+            and R_frame.dim() == 3
+            and R_frame.shape[0] == base_R.shape[0]
+        ):
+            return torch.bmm(
+                R_frame.to(device=base_R.device, dtype=base_R.dtype), base_R
+            )
+        return base_R
+
+    def _add_pose_loss(
+        self,
+        *,
+        loss_dict: dict,
+        pose_quat: torch.Tensor,
+        source_annotations: AnnotationResult,
+        annotations_for_loss: AnnotationResult,
+        used_rerender: bool,
+    ):
+        pose_weight = pose_quat.new_tensor(self.pose_weight if self.training else 0.0)
+        target_R = self._post_alignment_camera_R(
+            loss_dict=loss_dict,
+            source_annotations=source_annotations,
+            annotations_for_loss=annotations_for_loss,
+            used_rerender=used_rerender,
+        )
+        loss_pose, pose_angle_deg = _quaternion_pose_loss(pose_quat, target_R)
+        loss_dict["loss_pose"] = loss_pose
+        loss_dict["pose_weight"] = pose_weight
+        loss_dict["pose_angle_deg"] = pose_angle_deg.detach()
+        loss_dict["pose_quat"] = pose_quat.detach()
+        loss_dict["pose_target_quat"] = _rotation_matrix_to_quaternion(
+            target_R.detach()
+        )
+        loss_dict["loss_total"] = loss_dict["loss_total"] + pose_weight * loss_pose
 
     def _loss_with_rerendered_annotations(
         self,
@@ -462,7 +555,8 @@ class Model(nn.Module):
             raise ValueError("Model.infer requires annotations or batch.annotations")
 
         img = batch.image_rgb
-        feats, logits, mask_logits = self.predict(img)
+        feats, mesh_descriptors, logits, mask_logits = self.predict(img)
+        pose_quat = self.pose_head(mesh_descriptors)
 
         matched_vertices = self.criterion.matching(logits)
         if use_gt_mask or not bool(self.cfg.model.get("learn_mask", True)):
@@ -498,5 +592,6 @@ class Model(nn.Module):
             "yx_sel": yx_sel,
             "logits": logits,
             "mask_logits": mask_logits,
+            "pose_quat": pose_quat,
             "feat_hw": tuple(feats.shape[-2:]),
         }

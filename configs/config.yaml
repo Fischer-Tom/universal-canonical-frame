@@ -82,4 +82,5 @@ representation:
 
 loss:
     mask_weight: 1.0
+    pose_weight: 1.0
     aug_consistency_weight: 0.0

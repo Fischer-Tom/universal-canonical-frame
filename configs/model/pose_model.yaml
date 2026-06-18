@@ -12,7 +12,7 @@ vggt:
 bottleneck_dim: 64
 output_size: [64, 64]
 
-backbone_arch: "vggt"
+backbone_arch: "dino"
 vggt_feature_source: "patch_embed"
 finetune_backbone: false
 adapt: false

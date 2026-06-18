@@ -45,3 +45,26 @@ class MaskHead(nn.Module):
 
     def forward(self, feats):
         return self.head(feats)
+
+
+
+class PoseHead(nn.Module):
+    def __init__(self, d_model: int = 512, hidden_dim: int = 256, dropout: float = 0.1):
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 4),
+        )
+        final = self.head[-1]
+        nn.init.zeros_(final.weight)
+        nn.init.zeros_(final.bias)
+        final.bias.data[0] = 1.0
+
+    def forward(self, mesh_descriptors: Tensor):
+        # mesh_descriptors: (num_vertices, B, C) from MeshDecoder.
+        pooled = mesh_descriptors.mean(dim=0)
+        quat = self.head(pooled)
+        return F.normalize(quat, dim=-1, eps=1e-8)
