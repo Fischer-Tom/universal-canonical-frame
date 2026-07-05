@@ -200,8 +200,8 @@ class DINOExtractor(nn.Module):
         adapt: bool = False,
     ):
         super().__init__()
-        weights_path = cfg.dino.remote_weights if os.path.exists(cfg.dino.remote_weights) else cfg.dino.local_weights
-        repo_path = cfg.dino.remote_repo_dir if os.path.exists(cfg.dino.remote_repo_dir) else cfg.dino.local_repo_dir
+        weights_path = cfg.dino.remote_weights
+        repo_path = cfg.dino.remote_repo_dir
         self.backbone = torch.hub.load(repo_path, cfg.dino.model, source="local", pretrained=False)
         self.backbone.load_state_dict(torch.load(weights_path))
         

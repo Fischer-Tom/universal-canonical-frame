@@ -42,19 +42,71 @@ class MeshDecoder(nn.Module):
             nn.Linear(d_model, d_model),
         )
         self.pos_embed_2d = PositionEmbeddingSine(d_model // 2, normalize=True)
+        self.obj_cond_proj = nn.Linear(d_model, d_model)
 
-    def forward(self, feats):
+    def forward(self, feats, obj_masks: Optional[Tensor] = None):
+        """Decode mesh vertex descriptors, one set per object instance.
+
+        obj_masks: (B, N, H, W) or (B, H, W), real per-instance silhouettes used
+        to (a) condition each object's queries with a masked-pooled feature and
+        (b) restrict cross-attention to that instance's pixels. None falls back
+        to a single (N=1) whole-image object, i.e. the original unconditioned
+        single-object behavior.
+
+        Returns a list of N tensors, each (num_vertices, B, d_model).
+        """
         if feats.dim() != 4:
             raise ValueError(f"feats must be (B,C,H,W), got {feats.shape}")
+        B, C, H, W = feats.shape
+
+        if obj_masks is None:
+            obj_masks = feats.new_ones((B, 1, H, W))
+        else:
+            if obj_masks.dim() == 3:
+                obj_masks = obj_masks.unsqueeze(1)
+            if tuple(obj_masks.shape[-2:]) != (H, W):
+                obj_masks = F.interpolate(
+                    obj_masks.float(), size=(H, W), mode="nearest"
+                )
+            obj_masks = obj_masks.to(device=feats.device, dtype=feats.dtype)
+        N = obj_masks.shape[1]
 
         memory = feats.flatten(2).permute(2, 0, 1)  # (HW, B, C)
         pos = rearrange(self.pos_embed_2d(feats), "b c h w -> (h w) b c")
+        if N > 1:
+            memory = memory.repeat_interleave(N, dim=1)  # (HW, B*N, C)
+            pos = pos.repeat_interleave(N, dim=1)
 
-        B = memory.shape[1]
-        query_content = self.querys_embed.weight.unsqueeze(1).repeat(1, B, 1)
-        vertex_pos = self.positional_embedding_verts(self.V).unsqueeze(1).repeat(1, B, 1)
+        mask_flat = obj_masks.flatten(2)  # (B, N, HW)
+        denom = mask_flat.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        feats_flat = feats.flatten(2).permute(0, 2, 1)  # (B, HW, C)
+        obj_cond = torch.bmm(mask_flat, feats_flat) / denom  # (B, N, C)
+        obj_cond = self.obj_cond_proj(obj_cond).reshape(B * N, C)  # order: b*N + n
 
-        return self.decoder(tgt=query_content, memory=memory, pos=pos, query_pos=vertex_pos)
+        query_content = self.querys_embed.weight.unsqueeze(1).repeat(1, B * N, 1)
+        query_content = query_content + obj_cond.unsqueeze(0)
+        vertex_pos = self.positional_embedding_verts(self.V).unsqueeze(1).repeat(
+            1, B * N, 1
+        )
+
+        key_padding_mask = mask_flat.reshape(B * N, H * W) <= 0
+        empty = key_padding_mask.all(dim=1)
+        if empty.any():
+            key_padding_mask = key_padding_mask.masked_fill(
+                empty.unsqueeze(1), False
+            )
+
+        hs = self.decoder(
+            tgt=query_content,
+            memory=memory,
+            pos=pos,
+            query_pos=vertex_pos,
+            memory_key_padding_mask=key_padding_mask,
+        )  # (Q, B*N, D)
+
+        Q = hs.shape[0]
+        hs = hs.view(Q, B, N, -1)
+        return [hs[:, :, i, :] for i in range(N)]
 
 
 class TransformerDecoder(nn.Module):

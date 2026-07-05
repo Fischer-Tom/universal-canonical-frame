@@ -16,14 +16,15 @@ seed: 42
 
 training:
     epochs: 15
-    batch_size: 8
+    batch_size: 6
     device: "cuda"
     num_workers: 16
     image_size: [256, 256]
     use_torch_compile: false
+    empty_cache_interval: 1000
 
     augmentation:
-        crop_to_mask: true
+        crop_to_mask: false
         crop_padding: 0.1
         crop_padding_range: [0.1, 0.25]
         geometric_start_iter: 7500
@@ -61,8 +62,8 @@ logging:
     log_interval: 100
 
 evaluation:
-    checkpoint: ~
-    datasets: ["dataset"]
+    checkpoint: "runs/2026-07-04_15-46-18/checkpoints/latest.pth" 
+    datasets: ["imagenet3d"]
     split: "val"
     output_root: eval_logs
     symmetries_csv: "/tmp/ucf_symmetries.csv"
@@ -82,5 +83,5 @@ representation:
 
 loss:
     mask_weight: 1.0
-    pose_weight: 1.0
+    pose_weight: 0.0
     aug_consistency_weight: 0.0

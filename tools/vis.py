@@ -16,14 +16,19 @@ def _unnormalize(img: torch.Tensor) -> torch.Tensor:
     return (img * s + m).clamp(0, 1)
 
 
-def correspondence_rgb(logits: torch.Tensor, V: torch.Tensor, H: int, W: int) -> torch.Tensor:
-    """Argmax vertex per pixel → XYZ normalized to [0,1]^3 as RGB.
+def correspondence_rgb(logits_or_idx: torch.Tensor, V: torch.Tensor, H: int, W: int) -> torch.Tensor:
+    """Map either logits or precomputed vertex indices to XYZ-normalized RGB.
 
-    logits: (B, Q, H*W)   V: (Q, 3)
+    logits_or_idx: (B, Q, H*W) logits or (B, H*W) vertex indices.
+    V: (Q, 3) vertices.
     returns: (B, 3, H, W)
     """
-    idx = logits.float().argmax(dim=1)          # (B, H*W)
-    xyz = V[idx]                                # (B, H*W, 3)
+    if logits_or_idx.dim() == 2:
+        idx = logits_or_idx.long()
+    else:
+        idx = logits_or_idx.float().argmax(dim=1)
+    V = V.to(device=idx.device)
+    xyz = V[idx]
     xyz = xyz.view(-1, H, W, 3).permute(0, 3, 1, 2).contiguous()
     mn = V.amin(0).view(1, 3, 1, 1)
     mx = V.amax(0).view(1, 3, 1, 1)

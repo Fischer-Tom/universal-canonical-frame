@@ -4,7 +4,13 @@ from torch import Tensor, nn
 
 
 class MeshCorrespondenceHead(nn.Module):
-    def __init__(self, d_model: int = 256, d_desc: int = 128):
+    def __init__(
+        self,
+        d_model: int = 256,
+        d_desc: int = 128,
+        mask_topk: int = 8,
+        mask_hidden: int = 32,
+    ):
         super().__init__()
         self.query_proj = nn.Linear(d_model, d_desc)
         self.feat_proj = nn.Sequential(
@@ -14,9 +20,16 @@ class MeshCorrespondenceHead(nn.Module):
             nn.GELU(),
             nn.Conv2d(d_desc, d_desc, 1),
         )
+        self.mask_topk = mask_topk
+        self.mask_head = nn.Sequential(
+            nn.Linear(2, mask_hidden),
+            nn.GELU(),
+            nn.Linear(mask_hidden, 1),
+        )
 
     def forward(self, hs: Tensor, feats: Tensor):
         # hs: (num_queries, B, d_model)  feats: (B, d_model, H, W)
+        # returns sim: (B, Q, H*W), mask_logits: (B, 1, H, W)
         q = hs.permute(1, 0, 2)
         q_desc = self.query_proj(q)
 
@@ -27,24 +40,20 @@ class MeshCorrespondenceHead(nn.Module):
         q_desc = F.normalize(q_desc, dim=-1)
         k_desc = F.normalize(k_desc, dim=-1)
 
-        return torch.matmul(q_desc, k_desc.transpose(1, 2))  # (B, Q, H*W)
+        sim = torch.matmul(q_desc, k_desc.transpose(1, 2))  # (B, Q, H*W)
 
+        # Mask logit derived from the correspondence similarity itself: a
+        # pixel that matches some vertex well is foreground. Uses pooled
+        # stats (not the raw per-vertex sim) so param count doesn't scale
+        # with the number of mesh vertices.
+        k = min(self.mask_topk, sim.shape[1])
+        topk_sim = sim.topk(k, dim=1).values  # (B, k, H*W)
+        stats = torch.stack(
+            [topk_sim[:, 0, :], topk_sim.mean(dim=1)], dim=-1
+        )  # (B, H*W, 2)
+        mask_logits = self.mask_head(stats).squeeze(-1).view(B, 1, H, W)
 
-class MaskHead(nn.Module):
-    def __init__(self, d_model=256):
-        super().__init__()
-        self.head = nn.Sequential(
-            nn.Conv2d(d_model, d_model // 2, 3, padding=1),
-            nn.GroupNorm(16, d_model // 2),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(d_model // 2, d_model // 4, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.GroupNorm(16, d_model // 4),
-            nn.Conv2d(d_model // 4, 1, 1),
-        )
-
-    def forward(self, feats):
-        return self.head(feats)
+        return sim, mask_logits
 
 
 
@@ -64,7 +73,8 @@ class PoseHead(nn.Module):
         final.bias.data[0] = 1.0
 
     def forward(self, mesh_descriptors: Tensor):
-        # mesh_descriptors: (num_vertices, B, C) from MeshDecoder.
+        # mesh_descriptors: (num_vertices, B, C) 
+        # NOTE: How is spatial information preserved here
         pooled = mesh_descriptors.mean(dim=0)
         quat = self.head(pooled)
         return F.normalize(quat, dim=-1, eps=1e-8)

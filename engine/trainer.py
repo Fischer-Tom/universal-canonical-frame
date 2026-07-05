@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import os
 import random
 from dataclasses import dataclass
@@ -172,8 +173,18 @@ def train(
     log_interval = int(cfg.logging.get("log_interval", 100))
     vis_interval = int(cfg.logging.get("vis_interval", log_interval * 1))
     clip_grad_norm = float(cfg.optimizer.get("clip_grad_norm", 0.0))
+    empty_cache_interval = int(cfg.training.get("empty_cache_interval", 0) or 0)
+    print(f"empty_cache_interval: {empty_cache_interval}")
     logger.info("Starting training loop")
     model.train()
+
+    if device.type == "cuda" and is_main_process():
+        # gc.collect()+empty_cache() didn't stop the growth, meaning whatever's
+        # accumulating is a genuine live reference, not cyclic garbage. Record
+        # full allocation history so an OOM snapshot has a stack trace for
+        # every still-allocated block instead of guessing again.
+        torch.cuda.memory._record_memory_history(max_entries=200000)
+    oom_snapshot_dumped = False
 
     resume_epoch = state.epoch
     for epoch in range(state.epoch, cfg.training.epochs):
@@ -200,11 +211,20 @@ def train(
             skip_local = False
             forward_completed = False
             loss_dict = None
+            capture_visualization = (
+                vis_interval > 0
+                and (state.iteration + 1) % vis_interval == 0
+                and is_main_process()
+            )
             try:
                 with torch.autocast(
                     device_type=device.type, enabled=use_mixed, dtype=torch.float16
                 ):
-                    loss_dict = model(batch, batch.annotations)
+                    loss_dict = model(
+                        batch,
+                        batch.annotations,
+                        capture_visualization=capture_visualization,
+                    )
                 forward_completed = True
                 loss = loss_dict["loss_total"]
                 if not torch.isfinite(loss):
@@ -231,6 +251,7 @@ def train(
                 torch.nn.utils.clip_grad_norm_(all_params, clip_grad_norm)
             scaler.step(optimizer)
             scaler.update()
+            vis_snapshot = loss_dict.pop("_vis_snapshot", None)
             lr_scheduler.step()
 
             if freeze_at and not state.lora_frozen and state.iteration >= freeze_at:
@@ -254,19 +275,15 @@ def train(
             if hasattr(fetcher, "set_iteration"):
                 fetcher.set_iteration(state.iteration)
 
-            if (
-                vis_interval > 0
-                and state.iteration % vis_interval == 0
-                and is_main_process()
-            ):
+            if vis_snapshot is not None and is_main_process():
                 try:
                     vis_path = str(logger.vis_dir / f"iter_{state.iteration:07d}.png")
                     save_correspondence_grid(
-                        model_without_ddp._last_img,
-                        model_without_ddp._last_geom_mask,
-                        model_without_ddp._last_logits,
+                        vis_snapshot["img"],
+                        vis_snapshot["geom_mask"],
+                        vis_snapshot["logits"],
                         model_without_ddp.V,
-                        model_without_ddp._last_feat_hw,
+                        vis_snapshot["feat_hw"],
                         vis_path,
                     )
                 except Exception as e:
@@ -300,6 +317,20 @@ def train(
                         cfg,
                     )
                     logger.info(f"Saved {iter_path}")
+
+            del vis_snapshot, loss, loss_dict, batch
+            if (
+                empty_cache_interval > 0
+                and device.type == "cuda"
+                and state.iteration % empty_cache_interval == 0
+            ):
+                # empty_cache() only returns memory Python has already freed via
+                # refcounting. Reference cycles (autograd graph nodes, dataclasses
+                # holding tensors that loop back through grad_fn) keep tensors
+                # alive until the cyclic collector runs, which empty_cache() does
+                # not trigger on its own — hence gc.collect() first.
+                gc.collect()
+                torch.cuda.empty_cache()
 
         state.epoch = epoch + 1
         resume_skip_batches = 0

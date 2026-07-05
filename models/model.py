@@ -7,13 +7,28 @@ from tools.annotate import AnnotationResult, Annotator
 
 from .criterion import Criterion
 from .dino import DINOExtractor
-from .heads import MaskHead, MeshCorrespondenceHead, PoseHead
+from .heads import MeshCorrespondenceHead, PoseHead
 from .mesh_decoder import MeshDecoder
 from .vggt import VGGTExtractor
 
 AUG_CONSISTENCY_TEMP = 0.1
 AUG_CONSISTENCY_MAX_PIXELS = 16384
 AUG_CONSISTENCY_MIN_CONFIDENCE = 0.0
+
+# Selected-pixel count varies with mask area, which means the tensors feeding
+# criterion.align()/RANSAC never repeat shape iter to iter. cuBLAS/cuDNN cache
+# a workspace/algo plan per unique shape and never evict it, so unbounded
+# shape drift shows up as CUDA memory that keeps growing (reserved, not
+# allocated) over thousands of iterations. Capping to a fixed count collapses
+# most iterations onto one shape so the plan cache converges.
+MAX_SELECTED_PIXELS = 16384
+
+
+def _cap_selection(max_pixels: int, b_sel: torch.Tensor, yx_sel: torch.Tensor, v_sel: torch.Tensor):
+    if max_pixels <= 0 or b_sel.shape[0] <= max_pixels:
+        return b_sel, yx_sel, v_sel
+    idx = torch.randperm(b_sel.shape[0], device=b_sel.device)[:max_pixels]
+    return b_sel[idx], yx_sel[idx], v_sel[idx]
 
 
 def _gather_valid_feats(feats_bchw: torch.Tensor, valid_mask_bhw: torch.Tensor):
@@ -202,7 +217,6 @@ class Model(nn.Module):
             V, n_blocks=6, n_heads=8, d_model=512, dim_feedforward=2048
         )
         self.correspondence_head = MeshCorrespondenceHead(d_model=512, d_desc=512)
-        self.mask_head = MaskHead(d_model=512)
         self.pose_head = PoseHead(d_model=512)
         pca_init = bool(cfg.representation.get("pca_init", True))
         discretize = bool(cfg.representation.get("discretize", True)) and pca_init
@@ -235,12 +249,27 @@ class Model(nn.Module):
         self.aug_consistency_min_conf = AUG_CONSISTENCY_MIN_CONFIDENCE
         self.photometric_aug = GpuPhotometricAug()
 
-    def predict(self, img: torch.Tensor):
+    def predict(self, img: torch.Tensor, obj_masks: torch.Tensor | None = None):
+        """Run the backbone + per-object mesh decoding.
+
+        obj_masks: (B, N, H, W) real object silhouettes, one per object
+        instance to condition on. None decodes a single unconditioned
+        whole-image object (N=1), matching the original single-object model.
+
+        Returns feats, and per-object lists (length N) of mesh_descriptors,
+        logits, and mask_logits. The mask logit for each object is derived
+        from that object's own correspondence similarities (no separate
+        mask head), so it's per-object for free.
+        """
         feats = self.backbone(img)
-        mesh_descriptors = self.mesh_decoder(feats)
-        logits = self.correspondence_head(mesh_descriptors, feats)
-        mask_logits = self.mask_head(feats)
-        return feats, mesh_descriptors, logits, mask_logits
+        mesh_descriptors_list = self.mesh_decoder(feats, obj_masks)
+        logits_list = []
+        mask_logits_list = []
+        for md in mesh_descriptors_list:
+            logits, mask_logits = self.correspondence_head(md, feats)
+            logits_list.append(logits)
+            mask_logits_list.append(mask_logits)
+        return feats, mesh_descriptors_list, logits_list, mask_logits_list
 
     def _correspondence_consistency_loss(
         self,
@@ -293,23 +322,31 @@ class Model(nn.Module):
         loss_ba = F.kl_div(logp_a, p_b.detach(), reduction="batchmean")
         return 0.5 * (loss_ab + loss_ba), logits_a.new_tensor(float(z_a.shape[0]))
 
-    def forward(self, batch: Batch, annotations: AnnotationResult):
+    def forward(
+        self,
+        batch: Batch,
+        annotations: AnnotationResult,
+        capture_visualization: bool = False,
+    ):
         img = batch.image_rgb
         geom_mask = annotations.geom_mask
         render_mask = annotations.render_mask
         valid_mask = annotations.valid_mask
         xyz = annotations.obj_xyz
 
-        feats, mesh_descriptors, logits, mask_logits = self.predict(img)
-        pose_quat = self.pose_head(mesh_descriptors)
+        obj_masks = batch.masks.float()  # (B, 1, H, W): real instance segmentation mask
+        feats, mesh_descriptors_list, logits_list, mask_logits_list = self.predict(
+            img, obj_masks
+        )
+        mesh_descriptors = mesh_descriptors_list[0]
+        logits = logits_list[0]
+        mask_logits = mask_logits_list[0]
 
-        self._last_logits = logits.detach()
-        self._last_img = img.detach()
-        self._last_geom_mask = geom_mask.detach()
-        self._last_feat_hw = tuple(feats.shape[-2:])
+        pose_quat = self.pose_head(mesh_descriptors)
 
         _, b_sel, yx_sel, mask_flat = _gather_valid_feats(feats, geom_mask.long())
         xyz_sel = xyz.reshape(-1, 3)[mask_flat.bool()]
+        b_sel, yx_sel, xyz_sel = _cap_selection(MAX_SELECTED_PIXELS, b_sel, yx_sel, xyz_sel)
 
         use_rerender = (
             self.training
@@ -364,7 +401,8 @@ class Model(nn.Module):
         if aug_scale > 0:
             img_aug, keep_aug = self.photometric_aug(img)
             with torch.no_grad():
-                _, _, logits_aug, _ = self.predict(img_aug)
+                _, _, logits_aug_list, _ = self.predict(img_aug, obj_masks)
+            logits_aug = logits_aug_list[0]
             loss_aug, n_aug = self._correspondence_consistency_loss(
                 logits,
                 logits_aug,
@@ -382,8 +420,17 @@ class Model(nn.Module):
             loss_dict["aug_consistency_weight"] = logits.new_tensor(0.0)
             loss_dict["aug_consistency_pixels"] = logits.new_tensor(0.0)
 
-        batch.annotations = annotations_for_loss
-        self._last_geom_mask = geom_mask_for_vis.detach()
+        # Keep per-iteration render outputs out of the Batch object. They can be
+        # large GPU tensors and are not needed after the loss is built.
+        batch.annotations = None
+        if capture_visualization:
+            vis_n = min(int(getattr(self, "_training_vis_max_n", 8)), int(img.shape[0]))
+            loss_dict["_vis_snapshot"] = {
+                "img": img.detach()[:vis_n].cpu(),
+                "geom_mask": geom_mask_for_vis.detach()[:vis_n].cpu(),
+                "logits": logits.detach()[:vis_n].argmax(dim=1).cpu(),
+                "feat_hw": tuple(feats.shape[-2:]),
+            }
         self.criterion.c_iter += 1
         return loss_dict
 
@@ -492,6 +539,7 @@ class Model(nn.Module):
             feats, rerendered.geom_mask.long()
         )
         xyz_new = rerendered.obj_xyz.reshape(-1, 3)[mask_flat_new.bool()]
+        b_new, yx_new, xyz_new = _cap_selection(MAX_SELECTED_PIXELS, b_new, yx_new, xyz_new)
         if yx_new.shape[0] == 0:
             loss_dict = self.criterion(
                 logits=logits,
@@ -543,55 +591,79 @@ class Model(nn.Module):
         annotations: AnnotationResult | None = None,
         *,
         use_gt_mask: bool = False,
+        obj_masks: torch.Tensor | None = None,
     ) -> dict:
         """Return the legacy evaluation correspondence contract.
 
         The pose evaluator expects sparse pixel-to-canonical-vertex matches:
         selected matched vertices (`m_v3d`), selected pixel indices (`yx_sel`),
         and selected frame indices (`b_sel`).
+
+        obj_masks: (B, N, H, W) real per-instance silhouettes, one per object
+        to produce a correspondence map for. Defaults to the single real
+        instance mask (batch.masks), matching the legacy single-object
+        contract. The top-level keys always describe object 0; the full
+        per-object list is under "objects".
         """
         annotations = annotations if annotations is not None else batch.annotations
         if annotations is None:
             raise ValueError("Model.infer requires annotations or batch.annotations")
+        if obj_masks is None:
+            obj_masks = batch.masks.float()
 
         img = batch.image_rgb
-        feats, mesh_descriptors, logits, mask_logits = self.predict(img)
-        pose_quat = self.pose_head(mesh_descriptors)
-
-        matched_vertices = self.criterion.matching(logits)
-        if use_gt_mask or not bool(self.cfg.model.get("learn_mask", True)):
-            pred_mask_binary = annotations.geom_mask.bool()
-        else:
-            pred_mask_binary = torch.sigmoid(mask_logits).squeeze(1) > 0.5
-            valid_mask = annotations.valid_mask
-            if valid_mask.dim() == 4:
-                valid_mask = valid_mask.squeeze(1)
-            if valid_mask.shape[-2:] != pred_mask_binary.shape[-2:]:
-                valid_mask = torch.nn.functional.interpolate(
-                    valid_mask.float().unsqueeze(1),
-                    size=pred_mask_binary.shape[-2:],
-                    mode="nearest",
-                ).squeeze(1)
-            pred_mask_binary = pred_mask_binary & valid_mask.bool()
-
-        _, b_sel, yx_sel, mask_flat = _gather_valid_feats(
-            feats, pred_mask_binary.long()
+        feats, mesh_descriptors_list, logits_list, mask_logits_list = self.predict(
+            img, obj_masks
         )
-        m_v3d = matched_vertices.reshape(-1, 3)[mask_flat.bool()]
+        feat_hw = tuple(feats.shape[-2:])
 
-        return {
-            "m_v3d": m_v3d,
-            "match_dict": {
-                "matches": m_v3d,
-                "b_sel": b_sel,
-                "yx_sel": yx_sel,
-            },
-            "mask": pred_mask_binary.float(),
-            "pred_mask": pred_mask_binary.float(),
-            "b_sel": b_sel,
-            "yx_sel": yx_sel,
-            "logits": logits,
-            "mask_logits": mask_logits,
-            "pose_quat": pose_quat,
-            "feat_hw": tuple(feats.shape[-2:]),
-        }
+        valid_mask = annotations.valid_mask
+        if valid_mask.dim() == 4:
+            valid_mask = valid_mask.squeeze(1)
+
+        objects = []
+        for i, (mesh_descriptors, logits, mask_logits) in enumerate(
+            zip(mesh_descriptors_list, logits_list, mask_logits_list)
+        ):
+            pose_quat = self.pose_head(mesh_descriptors)
+            matched_vertices = self.criterion.matching(logits)
+            if use_gt_mask or not bool(self.cfg.model.get("learn_mask", True)):
+                pred_mask_binary = obj_masks[:, i].bool()
+            else:
+                pred_mask_binary = torch.sigmoid(mask_logits).squeeze(1) > 0.5
+                obj_valid_mask = valid_mask
+                if obj_valid_mask.shape[-2:] != pred_mask_binary.shape[-2:]:
+                    obj_valid_mask = torch.nn.functional.interpolate(
+                        obj_valid_mask.float().unsqueeze(1),
+                        size=pred_mask_binary.shape[-2:],
+                        mode="nearest",
+                    ).squeeze(1)
+                pred_mask_binary = pred_mask_binary & obj_valid_mask.bool()
+
+            _, b_sel, yx_sel, mask_flat = _gather_valid_feats(
+                feats, pred_mask_binary.long()
+            )
+            m_v3d = matched_vertices.reshape(-1, 3)[mask_flat.bool()]
+
+            objects.append(
+                {
+                    "m_v3d": m_v3d,
+                    "match_dict": {
+                        "matches": m_v3d,
+                        "b_sel": b_sel,
+                        "yx_sel": yx_sel,
+                    },
+                    "mask": pred_mask_binary.float(),
+                    "pred_mask": pred_mask_binary.float(),
+                    "b_sel": b_sel,
+                    "yx_sel": yx_sel,
+                    "logits": logits,
+                    "mask_logits": mask_logits,
+                    "pose_quat": pose_quat,
+                }
+            )
+
+        result = dict(objects[0])
+        result["objects"] = objects
+        result["feat_hw"] = feat_hw
+        return result
