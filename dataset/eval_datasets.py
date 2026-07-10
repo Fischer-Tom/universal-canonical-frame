@@ -53,6 +53,9 @@ def load_off(off_file_name: str, to_torch: bool = False) -> tuple:
 
 
 def _opencv_to_camera(R_cv, tvec, K, image_size_hw) -> Camera:
+    """
+    Adapted from PyTorch3D's _cameras_from_opencv
+    """
     R_cv = torch.as_tensor(R_cv, dtype=torch.float32)
     tvec = torch.as_tensor(tvec, dtype=torch.float32).reshape(3)
     K = torch.as_tensor(K, dtype=torch.float32)
@@ -62,10 +65,14 @@ def _opencv_to_camera(R_cv, tvec, K, image_size_hw) -> Camera:
     R_row = R_cv.transpose(0, 1) @ cv_to_p3d
     T_row = tvec @ cv_to_p3d
 
-    fx = K[0, 0] / (W / 2.0)
-    fy = K[1, 1] / (H / 2.0)
-    px = K[0, 2] / (W / 2.0) - 1.0
-    py = 1.0 - K[1, 2] / (H / 2.0)
+    scale_y = H / 2.0
+    scale_x = W / 2.0
+    scale = min(scale_x, scale_y)
+
+    fx = K[0, 0] / scale
+    fy = K[1, 1] / scale
+    px = -(K[0, 2] - scale_x) / scale
+    py = -(K[1, 2] - scale_y) / scale
     return Camera(
         R=R_row.unsqueeze(0),
         T=T_row.unsqueeze(0),
@@ -115,7 +122,7 @@ def pascal3d_to_camera(
         ],
         dtype=torch.float32,
     )
-    R = Rroll @ Rx @ Rz
+    R = Rroll @ (Rx @ Rz)
     t = (-R @ C).view(3)
     flip = torch.diag(torch.tensor([-1.0, 1.0, -1.0]))
     R = flip @ R
